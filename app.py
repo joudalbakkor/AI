@@ -4,7 +4,9 @@ from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from io import BytesIO
 import time
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
 
 # عنوان التطبيق
 st.set_page_config(page_title="خريطة فرص التوسع - السعودية", layout="wide")
@@ -12,47 +14,66 @@ st.title("🗺️ نظام توصية التوسع الجغرافي - بيانا
 
 st.info("""
 **كيف يعمل النظام؟**
-يقوم النموذج بتحليل بيانات حقيقية من:
-1. 📊 Google Sheets (البيانات الديموغرافية - مُحدّثة لحظياً)
-2. 📍 OpenStreetMap (الإحداثيات الجغرافية - Live)
+يقوم النموذج بتحليل بيانات حية من:
+1. 📊 Google Sheets (مُحدّثة لحظياً)
+2. 📍 OpenStreetMap (الإحداثيات الجغرافية)
 """)
 
 # =========================
 # 1. الاتصال بـ Google Sheets
 # =========================
 
-@st.cache_data(ttl=300)  # تحديث كل 5 دقائق
+@st.cache_data(ttl=300)
 def get_saudi_cities_data():
     """
     جلب البيانات من Google Sheets
     """
     try:
-        # إنشاء اتصال بـ Google Sheets
-        conn = st.connection("gsheets", type=GSheetsConnection)
+        # نطاق الصلاحيات
+        scope = ["https://spreadsheets.google.com/feeds",
+                 "https://www.googleapis.com/auth/drive"]
         
-        # قراءة البيانات
-        df = conn.read(worksheet="Sheet1", usecols=[0, 1, 2, 3])
+        # محاولة قراءة بيانات الاعتماد من Streamlit Secrets
+        if hasattr(st, 'secrets') and 'GCP_SERVICE_ACCOUNT' in st.secrets:
+            creds_dict = st.secrets["GCP_SERVICE_ACCOUNT"]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            
+            # الحصول على اسم الـ Sheet من secrets أو استخدام الافتراضي
+            sheet_name = st.secrets.get("SHEET_NAME", "Saudi Cities Data")
+            sheet = client.open(sheet_name).sheet1
+            
+            # قراءة البيانات
+            records = sheet.get_all_records()
+            df = pd.DataFrame(records)
+            
+            # التأكد من أسماء الأعمدة
+            df.columns = ['المنطقة', 'عدد_السكان', 'عدد_الشركات', 'معدل_النمو_السكاني']
+            
+            # تحويل الأعمدة للأرقام
+            df['عدد_السكان'] = pd.to_numeric(df['عدد_السكان'], errors='coerce')
+            df['عدد_الشركات'] = pd.to_numeric(df['عدد_الشركات'], errors='coerce')
+            df['معدل_النمو_السكاني'] = pd.to_numeric(df['معدل_النمو_السكاني'], errors='coerce')
+            
+            return df
         
-        # التأكد من أسماء الأعمدة
-        df.columns = ['المنطقة', 'عدد_السكان', 'عدد_الشركات', 'معدل_النمو_السكاني']
-        
-        # تحويل الأعمدة للأرقام
-        df['عدد_السكان'] = pd.to_numeric(df['عدد_السكان'], errors='coerce')
-        df['عدد_الشركات'] = pd.to_numeric(df['عدد_الشركات'], errors='coerce')
-        df['معدل_النمو_السكاني'] = pd.to_numeric(df['معدل_النمو_السكاني'], errors='coerce')
-        
-        return df
+        else:
+            # بيانات احتياطية للعرض المحلي
+            st.warning("⚠️ لم يتم العثور على بيانات الاعتماد، يتم استخدام بيانات تجريبية")
+            return pd.DataFrame({
+                'المنطقة': ['الرياض', 'جدة', 'مكة', 'المدينة', 'الدمام'],
+                'عدد_السكان': [7600000, 4700000, 2100000, 1600000, 1300000],
+                'عدد_الشركات': [180000, 95000, 45000, 35000, 40000],
+                'معدل_النمو_السكاني': [3.2, 2.8, 2.5, 2.1, 1.9]
+            })
     
     except Exception as e:
         st.error(f"⚠️ خطأ في الاتصال بـ Google Sheets: {str(e)}")
-        st.info("💡 تأكد من إعدادات الاتصال في Streamlit Cloud")
-        
-        # بيانات احتياطية في حالة الخطأ
         return pd.DataFrame({
-            'المنطقة': ['الرياض', 'جدة', 'مكة'],
-            'عدد_السكان': [7600000, 4700000, 2100000],
-            'عدد_الشركات': [180000, 95000, 45000],
-            'معدل_النمو_السكاني': [3.2, 2.8, 2.5]
+            'المنطقة': ['الرياض', 'جدة'],
+            'عدد_السكان': [7600000, 4700000],
+            'عدد_الشركات': [180000, 95000],
+            'معدل_النمو_السكاني': [3.2, 2.8]
         })
 
 @st.cache_data(ttl=3600)
@@ -105,15 +126,12 @@ progress_bar = st.progress(0)
 with status_container:
     st.markdown("### ⏳ جاري تحميل البيانات من Google Sheets...")
 
-# جلب البيانات
 df_cities = get_saudi_cities_data()
 progress_bar.progress(33)
 
-# حساب درجات الفرص
 df_cities['درجة_الفرصة'] = df_cities.apply(calculate_opportunity_score, axis=1)
 progress_bar.progress(66)
 
-# الحصول على الإحداثيات
 if not df_cities.empty:
     df_coords = get_coordinates(df_cities['المنطقة'].tolist())
     df_merged = pd.merge(df_cities, df_coords, left_on='المنطقة', right_on='city', how='left')
@@ -122,7 +140,6 @@ else:
 
 progress_bar.progress(100)
 
-# إخفاء رسالة التحميل
 time.sleep(0.5)
 status_container.empty()
 progress_bar.empty()
@@ -149,7 +166,6 @@ with st.expander("🔍 فلاتر البحث المتقدمة", expanded=False):
     with col_f3:
         max_results = st.slider("عدد النتائج المعروضة", 3, 12, 5)
 
-# تطبيق الفلاتر
 df_filtered = df_merged[
     (df_merged['عدد_السكان'] >= min_population) & 
     (df_merged['معدل_النمو_السكاني'] >= min_growth)
@@ -183,15 +199,15 @@ with col1:
                     st.write(f"**عدد الشركات:** {row['عدد_الشركات']:,}")
                     
                     if row['معدل_النمو_السكاني'] > 3:
-                        st.success("🚀 منطقة سريعة النمو")
+                        st.success("🚀 منطقة سريعة النمو - فرصة استثمارية عالية")
                     elif row['عدد_السكان'] > 1000000:
-                        st.info("📈 سوق كبير")
+                        st.info("📈 سوق كبير - منافسة متوقعة")
                     else:
-                        st.warning("⚠️ سوق ناشئ")
+                        st.warning("⚠️ سوق ناشئ - يحتاج دراسة أعمق")
                 
                 st.markdown("---")
     else:
-        st.warning("⚠️ لا توجد مناطق تطابق الفلاتر")
+        st.warning("⚠️ لا توجد مناطق تطابق الفلاتر المحددة")
 
 with col2:
     st.subheader("📊 تحليل مقارن")
@@ -200,24 +216,35 @@ with col2:
         chart_data = df_filtered.set_index('المنطقة')[['درجة_الفرصة', 'معدل_النمو_السكاني']]
         st.bar_chart(chart_data * 10)
         
-        st.subheader("📈 جدول البيانات")
+        st.subheader("📈 جدول البيانات الكامل")
         st.dataframe(
             df_filtered[['المنطقة', 'عدد_السكان', 'عدد_الشركات', 'معدل_النمو_السكاني', 'درجة_الفرصة']],
             use_container_width=True,
             height=400
         )
+    else:
+        st.info("💡 عدّل الفلاتر لعرض النتائج")
 
 # =========================
 # 5. الخريطة
 # =========================
 
 st.markdown("---")
-st.subheader("🗺️ التوزيع الجغرافي")
+st.subheader("🗺️ التوزيع الجغرافي للفرص")
 
 if not df_filtered.empty and 'lat' in df_filtered.columns:
     map_data = df_filtered[['lat', 'lon', 'المنطقة', 'درجة_الفرصة']].copy()
     map_data = map_data.rename(columns={'lat': 'latitude', 'lon': 'longitude'})
+    
     st.map(map_data)
+    
+    st.info("""
+    💡 **كيفية قراءة الخريطة:**
+    - كل نقطة تمثل منطقة
+    - حجم النقطة يعكس درجة الفرصة
+    """)
+else:
+    st.warning("⚠️ لا توجد بيانات كافية لعرض الخريطة")
 
 # =========================
 # 6. التصدير
@@ -265,7 +292,6 @@ with st.expander("📚 عن النظام"):
     ### المميزات:
     - تحديث البيانات تلقائياً كل 5 دقائق
     - إمكانية تعديل البيانات من Google Sheets مباشرة
-    - خرائط تفاعلية دقيقة
     """)
 
 st.markdown("---")
